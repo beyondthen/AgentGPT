@@ -1,127 +1,143 @@
-from os import environ
-from random import randint
 from typing import List, Optional
 
-from langchain.chains import LLMChain
-from langchain.chat_models import ChatOpenAI
+from lanarky.responses import StreamingResponse
+from langchain.chat_models.base import BaseChatModel
+from langchain.output_parsers import PydanticOutputParser
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
+from loguru import logger
+from pydantic import ValidationError
 
-from reworkd_platform.settings import settings
 from reworkd_platform.web.api.agent.agent_service.agent_service import AgentService
-from reworkd_platform.web.api.agent.analysis import Analysis, get_default_analysis
-from reworkd_platform.web.api.agent.helpers import extract_tasks
-from reworkd_platform.web.api.agent.model_settings import ModelSettings
-from reworkd_platform.web.api.agent.prompts import (
-    start_goal_prompt,
-    analyze_task_prompt,
-    execute_task_prompt,
-    create_tasks_prompt,
+from reworkd_platform.web.api.agent.analysis import Analysis, AnalysisArguments
+from reworkd_platform.web.api.agent.helpers import (
+    call_model_with_handling,
+    openai_error_handler,
+    parse_with_handling,
 )
-
-GPT_35_TURBO = "gpt-3.5-turbo"
-
-
-def get_server_side_key() -> str:
-    keys = [
-        key.strip() for key in (settings.openai_api_key or "").split(",") if key.strip()
-    ]
-    return keys[randint(0, len(keys) - 1)] if keys else ""
-
-
-def create_model(model_settings: Optional[ModelSettings]) -> ChatOpenAI:
-    _model_settings = model_settings
-
-    if not model_settings or not model_settings.customApiKey:
-        _model_settings = None
-
-    return ChatOpenAI(
-        openai_api_key=_model_settings.customApiKey
-        if _model_settings
-        else get_server_side_key(),
-        temperature=_model_settings.customTemperature
-        if _model_settings and _model_settings.customTemperature is not None
-        else 0.9,
-        model_name=_model_settings.customModelName
-        if _model_settings and _model_settings.customModelName is not None
-        else GPT_35_TURBO,
-        max_tokens=_model_settings.maxTokens
-        if _model_settings and _model_settings.maxTokens is not None
-        else 400,
-    )
+from reworkd_platform.web.api.agent.prompts import (
+    analyze_task_prompt,
+    create_tasks_prompt,
+    start_goal_prompt,
+)
+from reworkd_platform.web.api.agent.task_output_parser import TaskOutputParser
+from reworkd_platform.web.api.agent.tools.open_ai_function import get_tool_function
+from reworkd_platform.web.api.agent.tools.tools import (
+    get_default_tool,
+    get_tool_from_name,
+    get_tool_name,
+    get_user_tools,
+)
+from reworkd_platform.web.api.errors import OpenAIError
+from reworkd_platform.web.api.memory.memory import AgentMemory
 
 
 class OpenAIAgentService(AgentService):
-    async def start_goal_agent(
-        self, model_settings: ModelSettings, goal: str, language: str
-    ) -> List[str]:
-        llm = create_model(model_settings)
-        chain = LLMChain(llm=llm, prompt=start_goal_prompt)
+    def __init__(
+        self,
+        model: BaseChatModel,
+        language: str,
+        agent_memory: AgentMemory,
+    ):
+        self.model = model
+        self.agent_memory = agent_memory
+        self.language = language
 
-        completion = chain.run({"goal": goal, "language": language})
-        print(f"Goal: {goal}, Completion: {completion}")
-        return extract_tasks(completion, [])
+    async def start_goal_agent(self, *, goal: str) -> List[str]:
+        completion = await call_model_with_handling(
+            self.model,
+            ChatPromptTemplate.from_messages(
+                [SystemMessagePromptTemplate(prompt=start_goal_prompt)]
+            ),
+            {"goal": goal, "language": self.language},
+        )
+
+        task_output_parser = TaskOutputParser(completed_tasks=[])
+        tasks = parse_with_handling(task_output_parser, completion)
+
+        with self.agent_memory as memory:
+            memory.reset_class()
+            memory.add_tasks(tasks)
+
+        return tasks
 
     async def analyze_task_agent(
-        self, model_settings: ModelSettings, goal: str, task: str
+        self, *, goal: str, task: str, tool_names: List[str]
     ) -> Analysis:
-        llm = create_model(model_settings)
-        chain = LLMChain(llm=llm, prompt=analyze_task_prompt)
-        actions = ["reason", "search"]
+        message = await openai_error_handler(
+            func=self.model.apredict_messages,
+            messages=analyze_task_prompt.format_prompt(
+                goal=goal,
+                task=task,
+                language=self.language,
+            ).to_messages(),
+            functions=list(map(get_tool_function, get_user_tools(tool_names))),
+        )
 
-        completion = chain.run({"goal": goal, "task": task, "actions": actions})
-        print("Analysis completion:\n", completion)
+        function_call = message.additional_kwargs.get("function_call", {})
+        completion = function_call.get("arguments", "")
+
         try:
-            return Analysis.parse_raw(completion)
-        except Exception as error:
-            print(f"Error parsing analysis: {error}")
-            return get_default_analysis()
+            pydantic_parser = PydanticOutputParser(pydantic_object=AnalysisArguments)
+            analysis_arguments = parse_with_handling(pydantic_parser, completion)
+            return Analysis(
+                action=function_call.get("name", get_tool_name(get_default_tool())),
+                **analysis_arguments.dict(),
+            )
+        except (OpenAIError, ValidationError):
+            return Analysis.get_default_analysis()
 
     async def execute_task_agent(
         self,
-        model_settings: ModelSettings,
+        *,
         goal: str,
-        language: str,
         task: str,
         analysis: Analysis,
-    ) -> str:
+    ) -> StreamingResponse:
         print("Execution analysis:", analysis)
 
-        if analysis.action == "search" and environ.get("SERP_API_KEY"):
-            # Implement SERP API call using Serper class if available
-            pass
-
-        llm = create_model(model_settings)
-        chain = LLMChain(llm=llm, prompt=execute_task_prompt)
-
-        completion = chain.run({"goal": goal, "language": language, "task": task})
-
-        if analysis.action == "search" and not environ.get("SERP_API_KEY"):
-            return (
-                f"ERROR: Failed to search as no SERP_API_KEY is provided in ENV."
-                f"\n\n{completion}"
-            )
-        return completion
+        tool_class = get_tool_from_name(analysis.action)
+        return await tool_class(self.model, self.language).call(
+            goal, task, analysis.arg
+        )
 
     async def create_tasks_agent(
         self,
-        model_settings: ModelSettings,
+        *,
         goal: str,
-        language: str,
         tasks: List[str],
         last_task: str,
         result: str,
         completed_tasks: Optional[List[str]] = None,
     ) -> List[str]:
-        llm = create_model(model_settings)
-        chain = LLMChain(llm=llm, prompt=create_tasks_prompt)
-
-        completion = chain.run(
+        completion = await call_model_with_handling(
+            self.model,
+            ChatPromptTemplate.from_messages(
+                [SystemMessagePromptTemplate(prompt=create_tasks_prompt)]
+            ),
             {
                 "goal": goal,
-                "language": language,
-                "tasks": tasks,
+                "language": self.language,
+                "tasks": "\n".join(tasks),
                 "lastTask": last_task,
                 "result": result,
-            }
+            },
         )
 
-        return extract_tasks(completion, completed_tasks or [])
+        previous_tasks = (completed_tasks or []) + tasks
+        tasks = [completion] if completion not in previous_tasks else []
+
+        unique_tasks = []
+        with self.agent_memory as memory:
+            for task in tasks:
+                similar_tasks = memory.get_similar_tasks(task)
+
+                # Check if similar tasks are found
+                if not similar_tasks:
+                    unique_tasks.append(task)
+                else:
+                    logger.info(f"Similar tasks to '{task}' found: {similar_tasks}")
+
+            if unique_tasks:
+                memory.add_tasks(unique_tasks)
+
+        return unique_tasks

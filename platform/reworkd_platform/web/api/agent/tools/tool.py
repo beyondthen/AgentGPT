@@ -1,16 +1,25 @@
 from abc import ABC, abstractmethod
 
-from reworkd_platform.web.api.agent.model_settings import ModelSettings
+from lanarky.responses import StreamingResponse
+from langchain.chat_models.base import BaseChatModel
 
 
 class Tool(ABC):
-    description: str
-    model_settings: ModelSettings
+    description: str = ""
+    public_description: str = ""
+    arg_description: str = "The argument to the function."
 
-    def __init__(self, description: str, model_settings: ModelSettings):
-        self.description = description
-        self.model_settings = model_settings
+    model: BaseChatModel
+    language: str
+
+    def __init__(self, model: BaseChatModel, language: str):
+        self.model = model
+        self.language = language
+
+    @staticmethod
+    def available() -> bool:
+        return True
 
     @abstractmethod
-    def call(self, goal: str, task: str, input_str: str) -> str:
+    async def call(self, goal: str, task: str, input_str: str) -> StreamingResponse:
         pass
